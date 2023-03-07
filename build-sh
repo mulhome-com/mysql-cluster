@@ -1,0 +1,404 @@
+#!/bin/bash
+
+scriptname="$(basename "$0")"
+
+print_usage () {
+	[ -z "$1" ] || printf "$1\n" >&2 
+	printf "USAGE:\n %s [OPTIONS]\n\n" "${scriptname}" >&2
+	printf "options:\n" >&2
+	printf " -h, --help         Display this help message and exit.\n" >&2
+	printf " -c, --config       The path to configure mysql server.\n" >&2
+	printf " -m, --master       The host for master mysql server.\n" >&2
+	printf " -p, --password     The root password for master mysql server.\n" >&2
+	printf " -P, --sub_pass     The root password for slave server.\n" >&2
+	printf " -r, --repli_pass   The replication password between master and slave.\n" >&2
+	printf " -s, --slave        The host for slave mysql server.\n" >&2
+	printf " -S, --service      The service for control mysql application.\n" >&2
+	printf " -u, --master_user  The user for controlling the master host.\n" >&2
+	printf " -U, --slave_user   The user for controlling the slave host.\n" >&2
+	exit 1
+}
+
+MASTER_LOGFILE=""
+MASTER_LOGPOS=""
+
+REPLI_PASS="password"
+SUB_PASS=""
+PASSWORD=""
+
+SERVICE_NAME="mysql"
+CONFIG="mysqld.cnf"
+
+MASTER_ADDR=""
+MASTER_USER=""
+SLAVE_ADDR=""
+SLAVE_USER=""
+
+while [ "$#" -gt 0 ]
+do
+	case $1 in
+		-c | --config)
+			shift
+			CONFIG=$1
+			shift
+			;;
+		-m | --master)
+			shift
+			MASTER_ADDR=$1
+			shift
+			;;
+		-p | --password)
+			shift
+			PASSWORD=$1
+			shift
+			;;
+		-P | --sub_pass)
+			shift
+			SUB_PASS=$1
+			shift
+			;;
+		-r | --repli_pass)
+			shift
+			REPLI_PASS=$1
+			shift
+			;;
+		-s | --slave)
+			shift
+			SLAVE_ADDR=$1
+			shift
+			;;
+		-S | --service)
+			shift
+			SERVICE_NAME=$1
+			shift
+			;;
+		-u | --master_user)
+			shift
+			MASTER_USER=$1
+			shift
+			;;
+		-U | --slave_user)
+			shift
+			SLAVE_USER=$1
+			shift
+			;;
+		-h | --help)
+			print_usage
+			exit 0
+			;;
+		*)
+			printf "ERROR: Unknown option: %s\n" "${1}" >&2
+			print_usage
+			;;
+	esac
+done
+
+function verify_addr () {
+	if [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+		echo "1"	
+	else
+		echo "0"
+	fi
+}
+
+function verify_conn () {
+	p=`ping $1 -c 1 -W 2 | grep '1 received' | grep '0% packet loss'`
+	if [ -z "${p}" ]; then
+		echo "0"
+	else
+		echo "1"
+	fi
+}
+
+function rsa_conn () {
+	r=`ssh -o PasswordAuthentication=no -o ConnectTimeout=1 $1 echo hello`
+	if [ "${r}" == "hello" ]; then
+		echo "1"
+	else
+		echo "0"
+	fi
+}
+
+function mysqladmin_exist () {
+	ssh -o PasswordAuthentication=no -o ConnectTimeout=1 $1 which mysqladmin
+}
+
+function mysql_version () {
+	ssh -o PasswordAuthentication=no -o ConnectTimeout=1 $1 "mysqladmin --version | awk '{print$5}'"
+}
+
+function mysqlservice_exist () {
+	ssh -o PasswordAuthentication=no -o ConnectTimeout=1 $1 "systemctl list-units | grep $2"
+}
+
+function mysqlconfig_exist () {
+	ssh -o PasswordAuthentication=no -o ConnectTimeout=1 $1 "[[ -f $2 ]] | echo 1"
+}
+
+function mysqlpassword_verify () {
+	ssh -o PasswordAuthentication=no -o ConnectTimeout=1 $1 "mysql -uroot $2 -e 'select 1;'"
+}
+
+function mysqlreplipassword () {
+	ssh -o PasswordAuthentication=no -o ConnectTimeout=1 $1 "mysql -ureplication_user -p$2 -h$3 -e 'select 1;'"
+}
+
+function mysqlmaster_info () {
+	info=`ssh -o PasswordAuthentication=no -o ConnectTimeout=1 $1 "mysql -uroot $2 -e 'show master status\G;'"`
+	MASTER_LOGFILE=$(echo "${info}" | grep File | awk -F ':' '{print$2}' | sed -e "s/ //g")
+	MASTER_LOGPOS=$(echo "${info}" | grep Position | awk -F ':' '{print$2}' | sed -e "s/ //g")
+}
+
+function mysqldump () {
+	ssh -o PasswordAuthentication=no -o ConnectTimeout=1 $1 "mysqldump -uroot $2 --all-databases > /tmp/data.sql"
+}
+
+function mysqlimport () {
+	ssh -o PasswordAuthentication=no -o ConnectTimeout=1 $1 "mysql -uroot $2 < /tmp/data.sql"
+}
+
+function remote_command () {
+	ssh -o PasswordAuthentication=no -o ConnectTimeout=1 $1 "$2"
+}
+
+function echo_file () {
+	echo -e "$1" >> $2
+}
+
+
+echo "Check the master host ..."
+[[ $(verify_addr ${MASTER_ADDR}) == "1" ]] || print_usage "ERROR: Master host ($MASTER_ADDR) is not a valid ip address!"
+[[ $(verify_conn ${MASTER_ADDR}) == "1" ]] || print_usage "ERROR: Master host ($MASTER_ADDR) cannot be connected!"
+
+master_domain=${MASTER_ADDR}
+[[ -z ${MASTER_USER} ]] || master_domain=${MASTER_USER}@${MASTER_ADDR}
+[[ $(rsa_conn ${master_domain}) == "1" ]] || print_usage "ERROR: Master host ($master_domain) cannot be ssh-login with RSA key!"
+sleep 1
+
+
+echo "Check the slave host ..."
+[[ $(verify_addr ${SLAVE_ADDR}) == "1" ]] || print_usage "ERROR: Slave host ($SLAVE_ADDR) is not a valid ip address!"
+[[ $(verify_conn ${SLAVE_ADDR}) == "1" ]] || print_usage "ERROR: Slave host ($SLAVE_ADDR) cannot be connected!"
+
+slave_domain=${SLAVE_ADDR}
+[[ -z ${SLAVE_USER} ]] || slave_domain=${SLAVE_USER}@${SLAVE_ADDR}
+[[ $(rsa_conn ${slave_domain}) == "1" ]] || print_usage "ERROR: Slave host ($slave_domain) cannot be ssh-login with RSA key!"
+sleep 1
+
+
+echo "Check the mysql installation ..."
+if [[ -z $(mysqladmin_exist ${master_domain}) ]]; then
+	print_usage "ERROR: Server mysql is not installed in the master host ($MASTER_ADDR)!"
+fi
+if [[ -z $(mysqladmin_exist ${slave_domain}) ]]; then
+	print_usage "ERROR: Server mysql is not installed in the slave host ($SLAVE_ADDR)!"
+fi
+sleep 1
+
+
+echo "Check the mysql version between master and slave host ..."
+master_version=$(mysql_version ${master_domain})
+
+[[ $(mysql_version ${slave_domain}) == "${master_version}" ]] || print_usage "ERROR: The mysql versions between master and slave are not matching!"
+sleep 1
+
+
+echo "Check the service name ..."
+if [[ -z $(mysqlservice_exist ${master_domain} ${SERVICE_NAME}) ]]; then
+	print_usage "ERROR: Service name (${SERVICE_NAME}) does not exist in the ${MASTER_ADDR}!"
+fi
+if [[ -z $(mysqlservice_exist ${slave_domain} ${SERVICE_NAME}) ]]; then
+	print_usage "ERROR: Service name (${SERVICE_NAME}) does not exist in the ${SLAVE_ADDR}!"
+fi
+sleep 1
+
+
+echo "Check the configure file ..."
+[[ $(mysqlconfig_exist ${master_domain} ${CONFIG}) ]] || print_usage "ERROR: The configure file ${CONFIG} does not exist in the master ${MASTER_ADDR}!"
+[[ $(mysqlconfig_exist ${slave_domain} ${CONFIG}) ]] || print_usage "ERROR: The configure file ${CONFIG} does not exist in the slave ${SLAVE_ADDR}!"
+sleep 1
+
+
+echo "Check the password ..."
+master_password=${PASSWORD}
+[[ -z ${master_password} ]] || master_password="-p${PASSWORD}"
+msg=$(mysqlpassword_verify ${master_domain} ${master_password})
+correct=$(echo "${msg}" | grep ^1)
+if [ -z "${correct}" ]; then
+	if [ -z "${PASSWORD}" ]; then
+		print_usage "ERROR: The root password for master server cannot be empty!"
+	else
+		print_usage "ERROR: The root password for master server is not correct!"
+	fi
+fi
+slave_password=${SUB_PASS}
+[[ -z ${slave_password} ]] || slave_password="-p${SUB_PASS}"
+msg=$(mysqlpassword_verify ${slave_domain} ${slave_password})
+correct=$(echo "${msg}" | grep ^1)
+if [ -z "${correct}" ]; then
+	if [ -z "${SUB_PASS}" ]; then
+		print_usage "ERROR: The root password for slave server cannot be empty!"
+	else
+		print_usage "ERROR: The root password for slave server is not correct!"
+	fi
+fi
+sleep 1
+
+
+generate_master () {
+	echo "#!/bin/bash" > master.sh
+	echo_file '' master.sh
+
+	echo_file 'config () {' master.sh
+
+	echo_file '\tsudo bash -c "echo \"[mysqld]\" >> '${CONFIG}'"' master.sh
+	echo_file '' master.sh
+
+	echo_file '\techo "Add the feature for bind-address ..."' master.sh
+	echo_file '\tfeature_A=`grep ^bind-address '${CONFIG}'`' master.sh
+	echo_file '\t[ -z "${feature_A}" ] || sudo sed -i -e "s/bind-address/\#bind-address/g" '${CONFIG} master.sh
+	echo_file '\tsudo bash -c "echo \"bind-address = '${MASTER_ADDR}'\" >> '${CONFIG}'"' master.sh
+	echo_file '\tsleep 1' master.sh
+	echo_file '' master.sh
+
+	echo_file '\techo "Add the feature for server id ..."' master.sh
+	echo_file '\tfeature_B=`grep ^server-id '${CONFIG}'`' master.sh
+	echo_file '\t[ -z "${feature_B}" ] || sudo sed -i -e "s/server-id/\#server-id/g" '${CONFIG} master.sh
+	echo_file '\tsudo bash -c "echo \"server-id = 1\" >> '${CONFIG}'"' master.sh
+	echo_file '\tsleep 1' master.sh
+	echo_file '' master.sh
+
+	echo_file '\techo "Add the feature for log bin ..."' master.sh
+	echo_file '\tfeature_C=`grep ^log_bin '${CONFIG}'`' master.sh
+	echo_file '\t[ -z "${fature_C}" ] || sudo sed -i -e "s/log_bin/\#log_bin/g" '${CONFIG} master.sh
+	echo_file '\tsudo bash -c "echo \"log_bin = /var/log/mysql/mysql-bin.log \" >> '${CONFIG}'"' master.sh
+	echo_file '\tsudo bash -c "echo \"log_bin_index =/var/log/mysql/mysql-bin.log.index \" >> '${CONFIG}'"' master.sh
+	echo_file '\tsudo bash -c "echo \"relay_log = /var/log/mysql/mysql-relay-bin \" >> '${CONFIG}'"' master.sh
+	echo_file '\tsudo bash -c "echo \"relay_log_index = /var/log/mysql/mysql-relay-bin.index \" >> '${CONFIG}'"' master.sh
+	echo_file '\tsleep 1' master.sh
+	echo_file '' master.sh
+
+	echo_file '\techo "Restart the service for mysql ..."' master.sh
+	echo_file '\tsudo systemctl restart '${SERVICE_NAME} master.sh
+	echo_file '}' master.sh
+	echo_file '' master.sh
+
+	echo_file 'create_replication () {' master.sh
+	echo_file '\tmysql '${master_password}' -uroot -e "CREATE USER replication_user@'${SLAVE_ADDR}' IDENTIFIED BY \"'${REPLI_PASS}'\";"' master.sh
+	echo_file '\tmysql '${master_password}' -uroot -e "GRANT REPLICATION SLAVE ON *.* TO replication_user@'${SLAVE_ADDR}';"' master.sh
+	echo_file '\tmysql '${master_password}' -uroot -e "FLUSH PRIVILEGES;"' master.sh
+	echo_file '}' master.sh
+	echo_file '' master.sh
+
+	echo_file 'has_config=`grep "^bind-address = '${MASTER_ADDR}'" '${CONFIG}'`' master.sh
+	echo_file 'if [[ -z ${has_config} ]]; then' master.sh
+	echo_file '\tconfig' master.sh
+	echo_file 'fi' master.sh
+	echo_file '' master.sh
+
+	echo_file 'replication_user=`mysql -pLUYbRr1F7hHP -uroot -e "select host, user from mysql.user;" | grep replication_user`' master.sh
+	echo_file 'has_replication=$(echo "${replication_user}" | grep ^'${SLAVE_ADDR}')' master.sh
+	echo_file 'if [[ -z ${has_replication} ]]; then' master.sh
+	echo_file '\tcreate_replication' master.sh
+	echo_file 'fi' master.sh
+}
+
+
+generate_slave () {
+	echo "#!/bin/bash" > slave.sh
+	echo_file '' slave.sh
+
+	echo_file 'config () {' slave.sh
+
+	echo_file '\tsudo bash -c "echo \"[mysqld]\" >> '${CONFIG}'"' slave.sh
+	echo_file '' slave.sh
+
+	echo_file '\techo "Add the feature for bind-address ..."' slave.sh
+	echo_file '\tfeature_A=`grep ^bind-address '${CONFIG}'`' slave.sh
+	echo_file '\t[ -z "${feature_A}" ] || sudo sed -i -e "s/bind-address/\#bind-address/g" '${CONFIG} slave.sh
+	echo_file '\tsudo bash -c "echo \"bind-address = '${SLAVE_ADDR}'\" >> '${CONFIG}'"' slave.sh
+	echo_file '\tsleep 1' slave.sh
+	echo_file '' slave.sh
+
+	echo_file '\techo "Add the feature for server id ..."' slave.sh
+	echo_file '\tfeature_B=`grep ^server-id '${CONFIG}'`' slave.sh
+	echo_file '\t[ -z "${feature_B}" ] || sudo sed -i -e "s/server-id/\#server-id/g" '${CONFIG} slave.sh
+	echo_file '\tsudo bash -c "echo \"server-id = 2\" >> '${CONFIG}'"' slave.sh
+	echo_file '\tsleep 1' slave.sh
+	echo_file '' slave.sh
+
+	echo_file '\techo "Add the feature for log bin ..."' slave.sh
+	echo_file '\tfeature_C=`grep ^log_bin '${CONFIG}'`' slave.sh
+	echo_file '\t[ -z "${fature_C}" ] || sudo sed -i -e "s/log_bin/\#log_bin/g" '${CONFIG} slave.sh
+	echo_file '\tsudo bash -c "echo \"log_bin = /var/log/mysql/mysql-bin.log \" >> '${CONFIG}'"' slave.sh
+	echo_file '\tsudo bash -c "echo \"log_bin_index =/var/log/mysql/mysql-bin.log.index \" >> '${CONFIG}'"' slave.sh
+	echo_file '\tsudo bash -c "echo \"relay_log = /var/log/mysql/mysql-relay-bin \" >> '${CONFIG}'"' slave.sh
+	echo_file '\tsudo bash -c "echo \"relay_log_index = /var/log/mysql/mysql-relay-bin.index \" >> '${CONFIG}'"' slave.sh
+	echo_file '\tsleep 1' slave.sh
+	echo_file '' slave.sh
+
+	echo_file '\techo "Restart the service for mysql ..."' slave.sh
+	echo_file '\tsudo mkdir -p /var/log/mysql ' slave.sh
+	echo_file '\tsudo systemctl restart '${SERVICE_NAME} slave.sh
+	echo_file '}' slave.sh
+	echo_file '' slave.sh
+
+	echo_file 'create_master_host () {' slave.sh
+	echo_file '\techo "Create master host with password ..."' slave.sh
+	echo_file '\tmysql '${slave_password}' -uroot -e "STOP SLAVE;"' slave.sh
+	echo_file '\tmysql '${slave_password}' -uroot < /tmp/data.sql' slave.sh
+	echo_file '\tmysql '${slave_password}' -uroot -e "CHANGE MASTER TO MASTER_HOST = \"'${MASTER_ADDR}'\", MASTER_USER = \"replication_user\", MASTER_PASSWORD = \"'${REPLI_PASS}'\", MASTER_LOG_FILE = \"'"${MASTER_LOGFILE}"'\", MASTER_LOG_POS = '"${MASTER_LOGPOS}"';"' slave.sh
+	echo_file '\tmysql '${slave_password}' -uroot -e "START SLAVE;"' slave.sh
+	echo_file '}' slave.sh
+	echo_file '' slave.sh
+
+	echo_file 'has_config=`grep "^bind-address = '${SLAVE_ADDR}'" '${CONFIG}'`' slave.sh
+	echo_file 'if [[ -z ${has_config} ]]; then' slave.sh
+	echo_file '\tconfig' slave.sh
+	echo_file 'fi' slave.sh
+	echo_file '' slave.sh
+
+	echo_file 'create_master_host' slave.sh
+}
+
+echo "Configure the master ..."
+generate_master
+scp master.sh ${master_domain}:/tmp/
+remote_command ${master_domain}  "bash /tmp/master.sh"
+remote_command ${master_domain}  "rm -rf /tmp/master.sh"
+rm -rf master.sh
+sleep 1
+
+echo "Check the password of replication user ..."
+msg=$(mysqlreplipassword ${slave_domain} ${REPLI_PASS} ${MASTER_ADDR})
+correct=$(echo "${msg}" | grep ^1)
+if [ -z "${correct}" ]; then
+	if [ "${REPLI_PASS}" == "password" ]; then
+		print_usage "ERROR: The replication password for slave server cannot be empty or connection between master and slave does not work!"
+	else
+		print_usage "ERROR: The replication password for slave server is not correct or connection between master and slave does not work!"
+	fi
+fi
+sleep 1
+
+echo "Fetch the information about master ..."
+mysqlmaster_info ${master_domain} ${master_password}
+mysqldump ${master_domain} ${master_password}
+scp ${master_domain}:/tmp/data.sql ./
+scp data.sql ${slave_domain}:/tmp/
+rm -rf data.sql
+sleep 1
+
+
+echo "Configure the slave ..."
+generate_slave
+scp slave.sh ${slave_domain}:/tmp/
+remote_command ${slave_domain}  "bash /tmp/slave.sh"
+remote_command ${slave_domain}  "rm -rf /tmp/slave.sh"
+rm -rf slave.sh
+sleep 1
+
+echo "Done!"
+
+#build-sh -m ${master_host_ip} -s ${slave_host_ip} -S mysql -c /etc/mysql/mysql.conf.d/mysqld.cnf -p ${master_mysql_root_password} -P ${slave_mysql_root_password}
+
